@@ -1,9 +1,21 @@
 /* ============================================================
    palletoptimizer — Controle de Comprovantes
-   Persistência local via IndexedDB (registros + arquivos).
-   Salvamento automático em pasta via File System Access API
-   (Chrome/Edge). Em navegadores sem suporte, cai para download
-   manual já com o nome correto de arquivo/pasta.
+
+   Estrutura de salvamento:
+
+   PASTA BASE
+   └── CLIENTE
+       └── março de 2026
+           └── CLIENTE-NFE.pdf
+
+   Regras:
+   - Usa a Data de Embarque para identificar o mês e o ano.
+   - Se a pasta do cliente já existir, ela será reutilizada.
+   - Se a pasta do mês já existir, ela será reutilizada.
+   - Se não existir, a pasta será criada automaticamente.
+   - Pastas como "março 2026" e "março de 2026" são reconhecidas
+     como a mesma pasta.
+   - Salvamento automático disponível no Chrome e Edge.
 ============================================================ */
 
 const DB_NAME = 'palletComprovantesDB';
@@ -13,48 +25,87 @@ const STORE_META = 'meta';
 const STORE_CARRIERS = 'carriers';
 
 const DEFAULT_CARRIERS = [
-    'SUA TRANSPORTADORA',
-    'SUA TRANSPORTADORA',
-    'SUA TRANSPORTADORA',
     'SUA TRANSPORTADORA'
 ];
 
+const MONTH_NAMES_PT_BR = [
+    'janeiro',
+    'fevereiro',
+    'março',
+    'abril',
+    'maio',
+    'junho',
+    'julho',
+    'agosto',
+    'setembro',
+    'outubro',
+    'novembro',
+    'dezembro'
+];
+
 let db = null;
-let dirHandle = null; // pasta base selecionada (File System Access API)
-let records = [];     // cache em memória: {id, nfe, cliente, transportadora, dataEmbarque, status, fileBlob, fileName, savedAuto}
-let carriers = [];    // cache em memória: {name, isDefault}
+let dirHandle = null;
+let records = [];
+let carriers = [];
+let clientFolders = [];
 let currentFilter = 'todos';
 let currentSearch = '';
 let editingId = null;
 let pendingUploadId = null;
+let toastTimeout = null;
 
 const supportsFSAccess = 'showDirectoryPicker' in window;
 
-/* ---------------- IndexedDB helpers ---------------- */
+/* ============================================================
+   INDEXEDDB
+============================================================ */
 
 function openDB() {
     return new Promise((resolve, reject) => {
-        const req = indexedDB.open(DB_NAME, DB_VERSION);
-        req.onupgradeneeded = () => {
-            const database = req.result;
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onupgradeneeded = () => {
+            const database = request.result;
+
             if (!database.objectStoreNames.contains(STORE_RECORDS)) {
-                database.createObjectStore(STORE_RECORDS, { keyPath: 'id' });
+                database.createObjectStore(STORE_RECORDS, {
+                    keyPath: 'id'
+                });
             }
+
             if (!database.objectStoreNames.contains(STORE_META)) {
-                database.createObjectStore(STORE_META, { keyPath: 'key' });
+                database.createObjectStore(STORE_META, {
+                    keyPath: 'key'
+                });
             }
+
             if (!database.objectStoreNames.contains(STORE_CARRIERS)) {
-                const store = database.createObjectStore(STORE_CARRIERS, { keyPath: 'name' });
-                store.transaction.oncomplete = async () => {
-                    // seed com a lista padrão na primeira criação
-                    const tx = database.transaction(STORE_CARRIERS, 'readwrite');
-                    const s = tx.objectStore(STORE_CARRIERS);
-                    DEFAULT_CARRIERS.forEach(name => s.put({ name, isDefault: true }));
+                const store = database.createObjectStore(STORE_CARRIERS, {
+                    keyPath: 'name'
+                });
+
+                store.transaction.oncomplete = () => {
+                    const transaction = database.transaction(
+                        STORE_CARRIERS,
+                        'readwrite'
+                    );
+
+                    const carrierStore = transaction.objectStore(
+                        STORE_CARRIERS
+                    );
+
+                    DEFAULT_CARRIERS.forEach((name) => {
+                        carrierStore.put({
+                            name,
+                            isDefault: true
+                        });
+                    });
                 };
             }
         };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
     });
 }
 
@@ -64,101 +115,270 @@ function txStore(storeName, mode) {
 
 function idbGetAll(storeName) {
     return new Promise((resolve, reject) => {
-        const req = txStore(storeName, 'readonly').getAll();
-        req.onsuccess = () => resolve(req.result || []);
-        req.onerror = () => reject(req.error);
-    });
-}
-
-function idbPut(storeName, value) {
-    return new Promise((resolve, reject) => {
-        const req = txStore(storeName, 'readwrite').put(value);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
-    });
-}
-
-function idbDelete(storeName, key) {
-    return new Promise((resolve, reject) => {
-        const req = txStore(storeName, 'readwrite').delete(key);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
+        const request = txStore(storeName, 'readonly').getAll();
+        request.onsuccess = () => resolve(request.result || []);
+        request.onerror = () => reject(request.error);
     });
 }
 
 function idbGet(storeName, key) {
     return new Promise((resolve, reject) => {
-        const req = txStore(storeName, 'readonly').get(key);
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        const request = txStore(storeName, 'readonly').get(key);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
     });
 }
 
-/* ---------------- Utilidades ---------------- */
+function idbPut(storeName, value) {
+    return new Promise((resolve, reject) => {
+        const request = txStore(storeName, 'readwrite').put(value);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+}
+
+function idbDelete(storeName, key) {
+    return new Promise((resolve, reject) => {
+        const request = txStore(storeName, 'readwrite').delete(key);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+    });
+}
+
+/* ============================================================
+   UTILIDADES
+============================================================ */
 
 function todayISO() {
-    const d = new Date();
-    return d.toISOString().slice(0, 10); // yyyy-mm-dd
+    const date = new Date();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+
+    return `${year}-${month}-${day}`;
 }
 
-function formatDateBR(iso) {
-    if (!iso) return '—';
-    const [y, m, d] = iso.split('-');
-    return `${d}/${m}/${y}`;
+function formatDateBR(value) {
+    const parsed = parseDataEmbarque(value);
+
+    if (!parsed) {
+        return '—';
+    }
+
+    return `${String(parsed.day).padStart(2, '0')}/${String(parsed.month).padStart(2, '0')}/${parsed.year}`;
 }
 
-function sanitizeName(str) {
-    return String(str || '')
+function parseDataEmbarque(value) {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return {
+            year: value.getFullYear(),
+            month: value.getMonth() + 1,
+            monthIndex: value.getMonth(),
+            day: value.getDate()
+        };
+    }
+
+    const raw = String(value || '').trim();
+
+    if (!raw) {
+        return null;
+    }
+
+    // Formato do input type="date": 2026-03-15
+    let match = /^(\d{4})-(\d{2})-(\d{2})(?:T.*)?$/.exec(raw);
+
+    if (match) {
+        return validateParsedDate(
+            Number(match[1]),
+            Number(match[2]),
+            Number(match[3])
+        );
+    }
+
+    // Formato brasileiro: 15/03/2026 ou 15-03-2026
+    match = /^(\d{2})[\/-](\d{2})[\/-](\d{4})$/.exec(raw);
+
+    if (match) {
+        return validateParsedDate(
+            Number(match[3]),
+            Number(match[2]),
+            Number(match[1])
+        );
+    }
+
+    return null;
+}
+
+function validateParsedDate(year, month, day) {
+    if (
+        !Number.isInteger(year) ||
+        !Number.isInteger(month) ||
+        !Number.isInteger(day) ||
+        year < 1900 ||
+        year > 9999 ||
+        month < 1 ||
+        month > 12 ||
+        day < 1 ||
+        day > 31
+    ) {
+        return null;
+    }
+
+    const date = new Date(year, month - 1, day);
+
+    if (
+        date.getFullYear() !== year ||
+        date.getMonth() !== month - 1 ||
+        date.getDate() !== day
+    ) {
+        return null;
+    }
+
+    return {
+        year,
+        month,
+        monthIndex: month - 1,
+        day
+    };
+}
+
+function sanitizeFileName(value, fallback = 'SEM_NOME') {
+    const clean = String(value || '')
         .trim()
-        .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // remove acentos
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
         .replace(/[^a-zA-Z0-9_-]+/g, '_')
         .replace(/_+/g, '_')
         .replace(/^_|_$/g, '');
+
+    return clean || fallback;
 }
 
-function folderNameFor(rec) {
-    return `${sanitizeName(rec.cliente)}-${sanitizeName(rec.nfe)}`;
+function safeFolderName(value, fallback = 'SEM_NOME') {
+    const clean = String(value || '')
+        .trim()
+        .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+        .replace(/\s+/g, ' ')
+        .replace(/[. ]+$/g, '');
+
+    return clean || fallback;
+}
+
+function normalizedFolderKey(value) {
+    return String(value || '')
+        .trim()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLocaleLowerCase('pt-BR')
+        .replace(/[^a-z0-9]+/g, '');
+}
+
+function normalizedMonthFolderKey(value) {
+    return String(value || '')
+        .trim()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLocaleLowerCase('pt-BR')
+        .replace(/\bde\b/g, '')
+        .replace(/[^a-z0-9]+/g, '');
+}
+
+function clientFolderNameFor(record) {
+    return safeFolderName(record.cliente, 'CLIENTE_SEM_NOME');
+}
+
+function fileBaseNameFor(record) {
+    const client = sanitizeFileName(record.cliente, 'CLIENTE');
+    const nfe = sanitizeFileName(record.nfe, 'SEM_NFE');
+
+    return `${client}-${nfe}`;
+}
+
+function monthFolderNameFor(record) {
+    const parsed = parseDataEmbarque(record.dataEmbarque);
+
+    if (!parsed) {
+        throw new Error(
+            'A Data de Embarque está vazia ou inválida. Edite o registro e informe a data correta antes de anexar o comprovante.'
+        );
+    }
+
+    return `${MONTH_NAMES_PT_BR[parsed.monthIndex]} de ${parsed.year}`;
 }
 
 function uid() {
-    return 'r_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    return `r_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-let toastTimeout = null;
-function showToast(msg, isError = false) {
-    const el = document.getElementById('toast');
-    el.textContent = msg;
-    el.classList.toggle('error', isError);
-    el.classList.add('show');
+function escapeHTML(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function showToast(message, isError = false) {
+    const element = document.getElementById('toast');
+
+    if (!element) {
+        console.log(message);
+        return;
+    }
+
+    element.textContent = message;
+    element.classList.toggle('error', isError);
+    element.classList.add('show');
+
     clearTimeout(toastTimeout);
-    toastTimeout = setTimeout(() => el.classList.remove('show'), 3200);
+
+    toastTimeout = setTimeout(() => {
+        element.classList.remove('show');
+    }, 4000);
 }
 
-/* ---------------- Pasta base (File System Access API) ---------------- */
+/* ============================================================
+   PASTA BASE E PASTAS DOS CLIENTES
+============================================================ */
 
 async function initFolderUI() {
     const dot = document.getElementById('folder-dot');
     const label = document.getElementById('folder-label');
-    const btn = document.getElementById('select-folder-btn');
+    const button = document.getElementById('select-folder-btn');
 
     if (!supportsFSAccess) {
-        btn.style.display = 'none';
-        dot.classList.remove('ok');
-        label.innerHTML = '<strong>Salvamento automático indisponível neste navegador.</strong> Use Chrome ou Edge para salvar direto na pasta — por enquanto os comprovantes serão baixados já com o nome correto.';
+        if (button) {
+            button.style.display = 'none';
+        }
+
+        if (dot) {
+            dot.classList.remove('ok');
+        }
+
+        if (label) {
+            label.innerHTML = '<strong>Salvamento automático indisponível.</strong> Use Google Chrome ou Microsoft Edge.';
+        }
+
         return;
     }
 
     try {
         const meta = await idbGet(STORE_META, 'dirHandle');
-        if (meta && meta.handle) {
-            const granted = await meta.handle.queryPermission({ mode: 'readwrite' });
-            if (granted === 'granted') {
-                dirHandle = meta.handle;
-            } else {
-                dirHandle = meta.handle; // ainda guardamos, mas pediremos permissão no uso
+
+        if (meta?.handle) {
+            dirHandle = meta.handle;
+
+            const permission = await dirHandle.queryPermission({
+                mode: 'readwrite'
+            });
+
+            if (permission === 'granted') {
+                await scanClientFolders();
             }
         }
-    } catch (e) {
+    } catch (error) {
+        console.warn('Não foi possível recuperar a pasta salva:', error);
         dirHandle = null;
     }
 
@@ -168,174 +388,545 @@ async function initFolderUI() {
 function updateFolderLabel() {
     const dot = document.getElementById('folder-dot');
     const label = document.getElementById('folder-label');
+
+    if (!dot || !label) {
+        return;
+    }
+
     if (dirHandle) {
+        const text = clientFolders.length === 1
+            ? '1 pasta de cliente encontrada'
+            : `${clientFolders.length} pastas de clientes encontradas`;
+
         dot.classList.add('ok');
-        label.innerHTML = `Pasta base: <strong>${dirHandle.name}</strong> — os comprovantes serão salvos automaticamente em subpastas "cliente-NFe".`;
+        label.innerHTML = `Pasta base: <strong>${escapeHTML(dirHandle.name)}</strong> — salvamento em <strong>CLIENTE / mês de ano</strong> (${text}).`;
     } else {
         dot.classList.remove('ok');
-        label.innerHTML = '<strong>Nenhuma pasta base selecionada.</strong> Selecione uma pasta para salvar os comprovantes automaticamente.';
+        label.innerHTML = '<strong>Nenhuma pasta base selecionada.</strong> Selecione a pasta que contém as pastas dos clientes.';
     }
 }
 
-async function selectBaseFolder() {
-    if (!supportsFSAccess) return;
-    try {
-        const handle = await window.showDirectoryPicker();
-        dirHandle = handle;
-        await idbPut(STORE_META, { key: 'dirHandle', handle });
+function renderClientDatalist() {
+    let list = document.getElementById('client-folder-list');
+
+    if (!list) {
+        list = document.createElement('datalist');
+        list.id = 'client-folder-list';
+        document.body.appendChild(list);
+    }
+
+    list.replaceChildren(
+        ...clientFolders.map((clientFolder) => {
+            const option = document.createElement('option');
+            option.value = clientFolder.name;
+            return option;
+        })
+    );
+
+    ['f-cliente', 'edit-cliente'].forEach((inputId) => {
+        const input = document.getElementById(inputId);
+
+        if (input) {
+            input.setAttribute('list', list.id);
+        }
+    });
+}
+
+async function scanClientFolders() {
+    clientFolders = [];
+
+    if (!dirHandle) {
+        renderClientDatalist();
         updateFolderLabel();
-        showToast('Pasta base selecionada com sucesso.');
-    } catch (e) {
-        // usuário cancelou o seletor — não é erro
+        return;
+    }
+
+    try {
+        for await (const [name, handle] of dirHandle.entries()) {
+            if (handle.kind === 'directory' && !name.startsWith('.')) {
+                clientFolders.push({
+                    name,
+                    handle,
+                    key: normalizedFolderKey(name)
+                });
+            }
+        }
+
+        clientFolders.sort((first, second) =>
+            first.name.localeCompare(second.name, 'pt-BR')
+        );
+    } catch (error) {
+        console.warn('Não foi possível listar as pastas dos clientes:', error);
+    }
+
+    renderClientDatalist();
+    updateFolderLabel();
+}
+
+async function selectBaseFolder() {
+    if (!supportsFSAccess) {
+        showToast('Use Google Chrome ou Microsoft Edge.', true);
+        return;
+    }
+
+    try {
+        dirHandle = await window.showDirectoryPicker();
+
+        await idbPut(STORE_META, {
+            key: 'dirHandle',
+            handle: dirHandle
+        });
+
+        await scanClientFolders();
+
+        showToast(
+            `Pasta selecionada. ${clientFolders.length} pasta(s) de cliente encontrada(s).`
+        );
+    } catch (error) {
+        console.log('Seleção de pasta cancelada.', error);
     }
 }
 
 async function ensurePermission() {
-    if (!dirHandle) return false;
+    if (!dirHandle) {
+        return false;
+    }
+
     try {
-        let perm = await dirHandle.queryPermission({ mode: 'readwrite' });
-        if (perm !== 'granted') {
-            perm = await dirHandle.requestPermission({ mode: 'readwrite' });
+        let permission = await dirHandle.queryPermission({
+            mode: 'readwrite'
+        });
+
+        if (permission !== 'granted') {
+            permission = await dirHandle.requestPermission({
+                mode: 'readwrite'
+            });
         }
-        return perm === 'granted';
-    } catch (e) {
+
+        return permission === 'granted';
+    } catch (error) {
+        console.error('Erro ao solicitar permissão da pasta:', error);
         return false;
     }
 }
 
-/* Salva o arquivo dentro de uma subpasta "cliente-NFe" na pasta base.
-   Retorna { ok, savedAuto, path } */
-async function saveFileToFolder(rec, file) {
-    const ext = (file.name.split('.').pop() || '').toLowerCase();
-    const folder = folderNameFor(rec);
-    const fileName = `${folder}.${ext}`;
+async function findExistingClientDirectory(parentHandle, desiredName) {
+    const desiredKey = normalizedFolderKey(desiredName);
 
-    if (dirHandle && (await ensurePermission())) {
+    for await (const [name, handle] of parentHandle.entries()) {
+        if (
+            handle.kind === 'directory' &&
+            normalizedFolderKey(name) === desiredKey
+        ) {
+            return {
+                name,
+                handle
+            };
+        }
+    }
+
+    return null;
+}
+
+async function findExistingMonthDirectory(parentHandle, desiredName) {
+    const desiredKey = normalizedMonthFolderKey(desiredName);
+
+    for await (const [name, handle] of parentHandle.entries()) {
+        if (
+            handle.kind === 'directory' &&
+            normalizedMonthFolderKey(name) === desiredKey
+        ) {
+            return {
+                name,
+                handle
+            };
+        }
+    }
+
+    return null;
+}
+
+async function getOrCreateClientDirectory(record) {
+    const desiredName = clientFolderNameFor(record);
+    const desiredKey = normalizedFolderKey(desiredName);
+
+    let clientDirectory = clientFolders.find(
+        (item) => item.key === desiredKey
+    );
+
+    if (!clientDirectory) {
+        const existingOnDisk = await findExistingClientDirectory(
+            dirHandle,
+            desiredName
+        );
+
+        if (existingOnDisk) {
+            clientDirectory = {
+                name: existingOnDisk.name,
+                handle: existingOnDisk.handle,
+                key: normalizedFolderKey(existingOnDisk.name)
+            };
+        }
+    }
+
+    if (clientDirectory) {
+        return clientDirectory;
+    }
+
+    const handle = await dirHandle.getDirectoryHandle(desiredName, {
+        create: true
+    });
+
+    const created = {
+        name: desiredName,
+        handle,
+        key: desiredKey
+    };
+
+    clientFolders.push(created);
+    clientFolders.sort((first, second) =>
+        first.name.localeCompare(second.name, 'pt-BR')
+    );
+
+    renderClientDatalist();
+    updateFolderLabel();
+
+    return created;
+}
+
+async function getOrCreateMonthDirectory(clientHandle, desiredMonthName) {
+    const existingMonth = await findExistingMonthDirectory(
+        clientHandle,
+        desiredMonthName
+    );
+
+    if (existingMonth) {
+        return existingMonth;
+    }
+
+    const handle = await clientHandle.getDirectoryHandle(
+        desiredMonthName,
+        {
+            create: true
+        }
+    );
+
+    return {
+        name: desiredMonthName,
+        handle
+    };
+}
+
+/* ============================================================
+   SALVAR COMPROVANTE
+============================================================ */
+
+async function saveFileToFolder(record, file) {
+    const extension = (
+        file.name.includes('.')
+            ? file.name.split('.').pop()
+            : ''
+    ).toLowerCase() || 'arquivo';
+
+    const fileName = `${fileBaseNameFor(record)}.${extension}`;
+    const clientName = clientFolderNameFor(record);
+
+    let monthName;
+
+    try {
+        monthName = monthFolderNameFor(record);
+    } catch (error) {
+        return {
+            ok: false,
+            savedAuto: false,
+            error: error.message
+        };
+    }
+
+    if (dirHandle && await ensurePermission()) {
         try {
-            const subDir = await dirHandle.getDirectoryHandle(folder, { create: true });
-            const fileHandle = await subDir.getFileHandle(fileName, { create: true });
+            // Atualiza a lista caso novas pastas tenham sido criadas fora do sistema.
+            await scanClientFolders();
+
+            const clientDirectory = await getOrCreateClientDirectory(record);
+            const monthDirectory = await getOrCreateMonthDirectory(
+                clientDirectory.handle,
+                monthName
+            );
+
+            const fileHandle = await monthDirectory.handle.getFileHandle(
+                fileName,
+                {
+                    create: true
+                }
+            );
+
             const writable = await fileHandle.createWritable();
             await writable.write(file);
             await writable.close();
-            return { ok: true, savedAuto: true, path: `${dirHandle.name}/${folder}/${fileName}` };
-        } catch (e) {
-            console.error(e);
-            // cai para download manual
+
+            return {
+                ok: true,
+                savedAuto: true,
+                fileName,
+                clientFolder: clientDirectory.name,
+                monthFolder: monthDirectory.name,
+                path: `${dirHandle.name}/${clientDirectory.name}/${monthDirectory.name}/${fileName}`
+            };
+        } catch (error) {
+            console.error('Erro ao salvar o comprovante:', error);
+
+            return {
+                ok: false,
+                savedAuto: false,
+                error: 'Não foi possível criar a pasta ou salvar o comprovante. Selecione novamente a pasta principal e tente outra vez.'
+            };
         }
     }
 
-    // fallback: baixa o arquivo já com o nome correto
+    // Em navegadores sem acesso direto às pastas, baixa o arquivo.
     const url = URL.createObjectURL(file);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+    const link = document.createElement('a');
+
+    link.href = url;
+    link.download = fileName;
+
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-    return { ok: true, savedAuto: false, path: `Downloads/${fileName} (mover para pasta "${folder}")` };
+
+    return {
+        ok: true,
+        savedAuto: false,
+        fileName,
+        clientFolder: clientName,
+        monthFolder: monthName,
+        path: `Downloads/${fileName} (mover para ${clientName}/${monthName})`
+    };
 }
 
-/* ---------------- Transportadoras ---------------- */
+/* ============================================================
+   TRANSPORTADORAS
+============================================================ */
 
 async function loadCarriers() {
     carriers = await idbGetAll(STORE_CARRIERS);
+
     if (carriers.length === 0) {
-        // fallback caso o seed do upgrade não tenha rodado (ex: DB já existia sem a store)
         for (const name of DEFAULT_CARRIERS) {
-            await idbPut(STORE_CARRIERS, { name, isDefault: true });
+            await idbPut(STORE_CARRIERS, {
+                name,
+                isDefault: true
+            });
         }
+
         carriers = await idbGetAll(STORE_CARRIERS);
     }
-    carriers.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+    carriers.sort((first, second) =>
+        first.name.localeCompare(second.name, 'pt-BR')
+    );
+
     renderCarrierDatalist();
     renderCarriersModalList();
 }
 
 function renderCarrierDatalist() {
     const list = document.getElementById('carrier-list');
-    list.innerHTML = carriers.map(c => `<option value="${c.name.replace(/"/g, '&quot;')}"></option>`).join('');
+
+    if (!list) {
+        return;
+    }
+
+    list.replaceChildren(
+        ...carriers.map((carrier) => {
+            const option = document.createElement('option');
+            option.value = carrier.name;
+            return option;
+        })
+    );
 }
 
-/* garante que uma transportadora digitada fique cadastrada para uso futuro */
 async function ensureCarrierRegistered(name) {
-    const clean = name.trim();
-    if (!clean) return;
-    const exists = carriers.some(c => c.name.toLowerCase() === clean.toLowerCase());
-    if (!exists) {
-        await idbPut(STORE_CARRIERS, { name: clean, isDefault: false });
-        carriers.push({ name: clean, isDefault: false });
-        carriers.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-        renderCarrierDatalist();
-        renderCarriersModalList();
+    const cleanName = String(name || '').trim();
+
+    if (!cleanName) {
+        return;
     }
+
+    const exists = carriers.some(
+        (carrier) =>
+            carrier.name.toLocaleLowerCase('pt-BR') ===
+            cleanName.toLocaleLowerCase('pt-BR')
+    );
+
+    if (exists) {
+        return;
+    }
+
+    const carrier = {
+        name: cleanName,
+        isDefault: false
+    };
+
+    await idbPut(STORE_CARRIERS, carrier);
+    carriers.push(carrier);
+
+    carriers.sort((first, second) =>
+        first.name.localeCompare(second.name, 'pt-BR')
+    );
+
+    renderCarrierDatalist();
+    renderCarriersModalList();
 }
 
 async function addCarrierManually(name) {
-    const clean = name.trim();
-    if (!clean) return;
-    const exists = carriers.some(c => c.name.toLowerCase() === clean.toLowerCase());
+    const cleanName = String(name || '').trim();
+
+    if (!cleanName) {
+        showToast('Digite o nome da transportadora.', true);
+        return;
+    }
+
+    const exists = carriers.some(
+        (carrier) =>
+            carrier.name.toLocaleLowerCase('pt-BR') ===
+            cleanName.toLocaleLowerCase('pt-BR')
+    );
+
     if (exists) {
         showToast('Essa transportadora já está cadastrada.', true);
         return;
     }
-    await idbPut(STORE_CARRIERS, { name: clean, isDefault: false });
-    carriers.push({ name: clean, isDefault: false });
-    carriers.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+    const carrier = {
+        name: cleanName,
+        isDefault: false
+    };
+
+    await idbPut(STORE_CARRIERS, carrier);
+    carriers.push(carrier);
+
+    carriers.sort((first, second) =>
+        first.name.localeCompare(second.name, 'pt-BR')
+    );
+
     renderCarrierDatalist();
     renderCarriersModalList();
-    showToast(`"${clean}" cadastrada.`);
+
+    showToast(`"${cleanName}" cadastrada.`);
 }
 
 async function removeCarrier(name) {
-    const inUse = records.some(r => r.transportadora.toLowerCase() === name.toLowerCase());
-    if (inUse && !confirm(`"${name}" está em uso em registros existentes. Remover mesmo assim da lista de sugestões?`)) return;
+    const inUse = records.some(
+        (record) =>
+            record.transportadora.toLocaleLowerCase('pt-BR') ===
+            name.toLocaleLowerCase('pt-BR')
+    );
+
+    if (
+        inUse &&
+        !confirm(`"${name}" está em uso. Remover mesmo assim da lista?`)
+    ) {
+        return;
+    }
+
     await idbDelete(STORE_CARRIERS, name);
-    carriers = carriers.filter(c => c.name !== name);
+    carriers = carriers.filter((carrier) => carrier.name !== name);
+
     renderCarrierDatalist();
     renderCarriersModalList();
-    showToast(`"${name}" removida da lista.`);
+
+    showToast(`"${name}" removida.`);
 }
 
 function renderCarriersModalList() {
-    const box = document.getElementById('carriers-list-box');
-    if (!box) return;
-    if (carriers.length === 0) {
-        box.innerHTML = `<div style="font-family:var(--mono);font-size:12px;color:var(--muted);">Nenhuma transportadora cadastrada.</div>`;
+    const container = document.getElementById('carriers-list-box');
+
+    if (!container) {
         return;
     }
-    box.innerHTML = carriers.map(c => `
-        <div class="carrier-row">
-            <span>${c.name}${c.isDefault ? '<span class="default-tag">padrão</span>' : ''}</span>
-            <button class="icon-btn del" title="Remover" onclick="removeCarrier('${c.name.replace(/'/g, "\\'")}')">🗑️</button>
-        </div>
-    `).join('');
+
+    if (carriers.length === 0) {
+        container.innerHTML = '<div style="font-family:var(--mono);font-size:12px;color:var(--muted);">Nenhuma transportadora cadastrada.</div>';
+        return;
+    }
+
+    container.innerHTML = carriers.map((carrier) => {
+        const escapedName = carrier.name
+            .replace(/\\/g, '\\\\')
+            .replace(/'/g, "\\'");
+
+        const defaultTag = carrier.isDefault
+            ? '<span class="default-tag">padrão</span>'
+            : '';
+
+        return `
+            <div class="carrier-row">
+                <span>${escapeHTML(carrier.name)}${defaultTag}</span>
+                <button
+                    class="icon-btn del"
+                    title="Remover"
+                    onclick="removeCarrier('${escapedName}')"
+                >🗑️</button>
+            </div>
+        `;
+    }).join('');
 }
 
 function openCarriersModal() {
     renderCarriersModalList();
-    document.getElementById('carriers-modal').classList.add('show');
+    document.getElementById('carriers-modal')?.classList.add('show');
 }
 
 function closeCarriersModal() {
-    document.getElementById('carriers-modal').classList.remove('show');
+    document.getElementById('carriers-modal')?.classList.remove('show');
 }
 
-/* ---------------- Registros ---------------- */
+/* ============================================================
+   REGISTROS
+============================================================ */
 
 async function loadRecords() {
     records = await idbGetAll(STORE_RECORDS);
-    records.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    records.sort(
+        (first, second) =>
+            (second.createdAt || 0) -
+            (first.createdAt || 0)
+    );
+
     renderAll();
 }
 
-async function addRecord(nfe, cliente, transportadora) {
-    const rec = {
+function getRegistrationDateValue() {
+    const possibleIds = [
+        'f-data',
+        'f-data-embarque',
+        'data-embarque',
+        'dataEmbarque'
+    ];
+
+    for (const id of possibleIds) {
+        const input = document.getElementById(id);
+
+        if (input?.value && parseDataEmbarque(input.value)) {
+            return input.value;
+        }
+    }
+
+    return todayISO();
+}
+
+async function addRecord(nfe, cliente, transportadora, dataEmbarque) {
+    const record = {
         id: uid(),
         nfe: nfe.trim(),
         cliente: cliente.trim(),
         transportadora: transportadora.trim(),
-        dataEmbarque: todayISO(),
+        dataEmbarque: dataEmbarque || todayISO(),
         status: 'pendente',
         fileBlob: null,
         fileName: null,
@@ -343,109 +934,202 @@ async function addRecord(nfe, cliente, transportadora) {
         savedPath: null,
         createdAt: Date.now()
     };
-    await idbPut(STORE_RECORDS, rec);
-    records.unshift(rec);
-    await ensureCarrierRegistered(rec.transportadora);
+
+    await idbPut(STORE_RECORDS, record);
+    records.unshift(record);
+
+    await ensureCarrierRegistered(record.transportadora);
+
     renderAll();
-    showToast(`Registro ${rec.nfe} adicionado. Aguardando comprovante.`);
+    showToast(`Registro ${record.nfe} adicionado. Aguardando comprovante.`);
 }
 
 async function deleteRecord(id) {
-    const rec = records.find(r => r.id === id);
-    if (!rec) return;
-    if (!confirm(`Excluir o registro da NF-e ${rec.nfe} (${rec.cliente})?`)) return;
+    const record = records.find((item) => item.id === id);
+
+    if (!record) {
+        return;
+    }
+
+    if (!confirm(`Excluir a NF-e ${record.nfe} (${record.cliente})?`)) {
+        return;
+    }
+
     await idbDelete(STORE_RECORDS, id);
-    records = records.filter(r => r.id !== id);
+    records = records.filter((item) => item.id !== id);
+
     renderAll();
     showToast('Registro excluído.');
 }
 
 function openEditModal(id) {
-    const rec = records.find(r => r.id === id);
-    if (!rec) return;
+    const record = records.find((item) => item.id === id);
+
+    if (!record) {
+        return;
+    }
+
     editingId = id;
-    document.getElementById('edit-nfe').value = rec.nfe;
-    document.getElementById('edit-cliente').value = rec.cliente;
-    document.getElementById('edit-transportadora').value = rec.transportadora;
-    document.getElementById('edit-data').value = rec.dataEmbarque;
-    document.getElementById('edit-modal').classList.add('show');
+
+    const nfeInput = document.getElementById('edit-nfe');
+    const clientInput = document.getElementById('edit-cliente');
+    const carrierInput = document.getElementById('edit-transportadora');
+    const dateInput = document.getElementById('edit-data');
+
+    if (nfeInput) nfeInput.value = record.nfe;
+    if (clientInput) clientInput.value = record.cliente;
+    if (carrierInput) carrierInput.value = record.transportadora;
+    if (dateInput) dateInput.value = record.dataEmbarque;
+
+    document.getElementById('edit-modal')?.classList.add('show');
 }
 
 function closeEditModal() {
     editingId = null;
-    document.getElementById('edit-modal').classList.remove('show');
+    document.getElementById('edit-modal')?.classList.remove('show');
 }
 
 async function saveEdit() {
-    const rec = records.find(r => r.id === editingId);
-    if (!rec) return;
-    rec.nfe = document.getElementById('edit-nfe').value.trim() || rec.nfe;
-    rec.cliente = document.getElementById('edit-cliente').value.trim() || rec.cliente;
-    rec.transportadora = document.getElementById('edit-transportadora').value.trim() || rec.transportadora;
-    rec.dataEmbarque = document.getElementById('edit-data').value || rec.dataEmbarque;
-    await idbPut(STORE_RECORDS, rec);
-    await ensureCarrierRegistered(rec.transportadora);
+    const record = records.find((item) => item.id === editingId);
+
+    if (!record) {
+        return;
+    }
+
+    const nfeValue = document.getElementById('edit-nfe')?.value.trim();
+    const clientValue = document.getElementById('edit-cliente')?.value.trim();
+    const carrierValue = document.getElementById('edit-transportadora')?.value.trim();
+    const dateValue = document.getElementById('edit-data')?.value;
+
+    if (dateValue && !parseDataEmbarque(dateValue)) {
+        showToast('Informe uma Data de Embarque válida.', true);
+        return;
+    }
+
+    record.nfe = nfeValue || record.nfe;
+    record.cliente = clientValue || record.cliente;
+    record.transportadora = carrierValue || record.transportadora;
+    record.dataEmbarque = dateValue || record.dataEmbarque;
+
+    await idbPut(STORE_RECORDS, record);
+    await ensureCarrierRegistered(record.transportadora);
+
     closeEditModal();
     renderAll();
+
     showToast('Registro atualizado.');
-    if (rec.fileBlob) {
-        showToast('Atenção: nome da pasta/arquivo pode ter mudado. Reenvie o comprovante para salvar no local correto.', true);
+
+    if (record.fileBlob) {
+        showToast(
+            'A data ou o cliente pode ter mudado. Anexe novamente o comprovante para salvá-lo na pasta correta.',
+            true
+        );
     }
 }
 
+/* ============================================================
+   ANEXAR E VISUALIZAR COMPROVANTE
+============================================================ */
+
 function requestUpload(id) {
     pendingUploadId = id;
-    document.getElementById('file-input').click();
+    document.getElementById('file-input')?.click();
 }
 
 async function handleFileSelected(file) {
-    if (!pendingUploadId) return;
-    const rec = records.find(r => r.id === pendingUploadId);
-    pendingUploadId = null;
-    if (!rec) return;
+    if (!pendingUploadId) {
+        return;
+    }
 
-    const allowed = ['image/png', 'image/jpeg', 'application/pdf'];
-    if (!allowed.includes(file.type)) {
+    const record = records.find((item) => item.id === pendingUploadId);
+    pendingUploadId = null;
+
+    if (!record) {
+        return;
+    }
+
+    const allowedTypes = [
+        'image/png',
+        'image/jpeg',
+        'application/pdf'
+    ];
+
+    if (!allowedTypes.includes(file.type)) {
         showToast('Formato inválido. Use JPG, PNG ou PDF.', true);
         return;
     }
 
-    const result = await saveFileToFolder(rec, file);
+    if (!parseDataEmbarque(record.dataEmbarque)) {
+        showToast(
+            'A Data de Embarque está inválida. Clique em Editar, informe a data e tente novamente.',
+            true
+        );
+        return;
+    }
 
-    rec.fileBlob = file;
-    rec.fileName = `${folderNameFor(rec)}.${(file.name.split('.').pop() || '').toLowerCase()}`;
-    rec.status = 'recebido';
-    rec.savedAuto = result.savedAuto;
-    rec.savedPath = result.path;
+    const result = await saveFileToFolder(record, file);
 
-    await idbPut(STORE_RECORDS, rec);
+    if (!result.ok) {
+        showToast(
+            result.error || 'Não foi possível salvar o comprovante.',
+            true
+        );
+        return;
+    }
+
+    record.fileBlob = file;
+    record.fileName = result.fileName;
+    record.status = 'recebido';
+    record.savedAuto = result.savedAuto;
+    record.savedPath = result.path;
+
+    await idbPut(STORE_RECORDS, record);
     renderAll();
 
     if (result.savedAuto) {
-        showToast(`Comprovante salvo automaticamente em: ${result.path}`);
+        showToast(`Comprovante salvo em: ${result.path}`);
     } else {
-        showToast(`Comprovante baixado como "${rec.fileName}". Mova para a pasta "${folderNameFor(rec)}".`);
+        showToast(
+            `Arquivo baixado como "${record.fileName}". Mova para ${result.clientFolder}/${result.monthFolder}.`
+        );
     }
 }
 
 function viewFile(id) {
-    const rec = records.find(r => r.id === id);
-    if (!rec || !rec.fileBlob) return;
-    const url = URL.createObjectURL(rec.fileBlob);
+    const record = records.find((item) => item.id === id);
+
+    if (!record?.fileBlob) {
+        return;
+    }
+
+    const url = URL.createObjectURL(record.fileBlob);
     window.open(url, '_blank');
+
     setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-/* ---------------- Render ---------------- */
+/* ============================================================
+   FILTROS E TABELA
+============================================================ */
 
-function matchesFilter(rec) {
-    if (currentFilter !== 'todos' && rec.status !== currentFilter) return false;
-    if (currentSearch) {
-        const s = currentSearch.toLowerCase();
-        return rec.nfe.toLowerCase().includes(s) ||
-               rec.cliente.toLowerCase().includes(s) ||
-               rec.transportadora.toLowerCase().includes(s);
+function matchesFilter(record) {
+    if (
+        currentFilter !== 'todos' &&
+        record.status !== currentFilter
+    ) {
+        return false;
     }
+
+    if (currentSearch) {
+        const search = currentSearch.toLocaleLowerCase('pt-BR');
+
+        return (
+            record.nfe.toLocaleLowerCase('pt-BR').includes(search) ||
+            record.cliente.toLocaleLowerCase('pt-BR').includes(search) ||
+            record.transportadora.toLocaleLowerCase('pt-BR').includes(search)
+        );
+    }
+
     return true;
 }
 
@@ -456,124 +1140,234 @@ function renderAll() {
 
 function renderStats() {
     const total = records.length;
-    const pendentes = records.filter(r => r.status === 'pendente').length;
-    const recebidos = records.filter(r => r.status === 'recebido').length;
-    document.getElementById('stat-total').textContent = total;
-    document.getElementById('stat-pendente').textContent = pendentes;
-    document.getElementById('stat-recebido').textContent = recebidos;
+    const pending = records.filter(
+        (record) => record.status === 'pendente'
+    ).length;
+    const received = records.filter(
+        (record) => record.status === 'recebido'
+    ).length;
+
+    const totalElement = document.getElementById('stat-total');
+    const pendingElement = document.getElementById('stat-pendente');
+    const receivedElement = document.getElementById('stat-recebido');
+
+    if (totalElement) totalElement.textContent = total;
+    if (pendingElement) pendingElement.textContent = pending;
+    if (receivedElement) receivedElement.textContent = received;
 }
 
 function renderTable() {
-    const tbody = document.getElementById('table-body');
-    const filtered = records.filter(matchesFilter);
+    const tableBody = document.getElementById('table-body');
 
-    if (filtered.length === 0) {
-        tbody.innerHTML = `<tr class="empty-row"><td colspan="7">Nenhum registro encontrado.</td></tr>`;
+    if (!tableBody) {
         return;
     }
 
-    tbody.innerHTML = filtered.map(rec => {
-        const isRecebido = rec.status === 'recebido';
-        const compCell = isRecebido
-            ? `<div class="comp-cell">
-                   <button class="comp-link" onclick="viewFile('${rec.id}')">👁️ Ver</button>
-                   <button class="comp-link" onclick="requestUpload('${rec.id}')">🔁 Trocar</button>
-               </div>
-               <div class="saved-tag">${rec.savedAuto ? '📁 salvo automaticamente' : '⬇️ baixado manualmente'}</div>`
-            : `<button class="btn btn-green btn-small" onclick="requestUpload('${rec.id}')">📎 Anexar Comprovante</button>`;
+    const filteredRecords = records.filter(matchesFilter);
 
-        const badge = isRecebido
-            ? `<span class="badge recebido"><span class="dot"></span>Recebido</span>`
-            : `<span class="badge pendente"><span class="dot"></span>Pendente</span>`;
+    if (filteredRecords.length === 0) {
+        tableBody.innerHTML = '<tr class="empty-row"><td colspan="7">Nenhum registro encontrado.</td></tr>';
+        return;
+    }
+
+    tableBody.innerHTML = filteredRecords.map((record) => {
+        const received = record.status === 'recebido';
+
+        const receiptCell = received
+            ? `
+                <div class="comp-cell">
+                    <button class="comp-link" onclick="viewFile('${record.id}')">👁️ Ver</button>
+                    <button class="comp-link" onclick="requestUpload('${record.id}')">🔁 Trocar</button>
+                </div>
+                <div class="saved-tag">
+                    ${record.savedAuto ? '📁 salvo automaticamente' : '⬇️ baixado manualmente'}
+                </div>
+            `
+            : `
+                <button class="btn btn-green btn-small" onclick="requestUpload('${record.id}')">
+                    📎 Anexar Comprovante
+                </button>
+            `;
+
+        const badge = received
+            ? '<span class="badge recebido"><span class="dot"></span>Recebido</span>'
+            : '<span class="badge pendente"><span class="dot"></span>Pendente</span>';
 
         return `
             <tr>
-                <td class="data" data-label="Data de Embarque">${formatDateBR(rec.dataEmbarque)}</td>
-                <td class="nfe" data-label="NF-e">${rec.nfe}</td>
-                <td data-label="Cliente">${rec.cliente}</td>
-                <td data-label="Transportadora">${rec.transportadora}</td>
-                <td data-label="Comprovante">${compCell}</td>
+                <td class="data" data-label="Data de Embarque">${formatDateBR(record.dataEmbarque)}</td>
+                <td class="nfe" data-label="NF-e">${escapeHTML(record.nfe)}</td>
+                <td data-label="Cliente">${escapeHTML(record.cliente)}</td>
+                <td data-label="Transportadora">${escapeHTML(record.transportadora)}</td>
+                <td data-label="Comprovante">${receiptCell}</td>
                 <td data-label="Status">${badge}</td>
                 <td data-label="Ações">
                     <div class="actions-cell">
-                        <button class="icon-btn edit" title="Editar" onclick="openEditModal('${rec.id}')">✏️</button>
-                        <button class="icon-btn del" title="Excluir" onclick="deleteRecord('${rec.id}')">🗑️</button>
+                        <button class="icon-btn edit" title="Editar" onclick="openEditModal('${record.id}')">✏️</button>
+                        <button class="icon-btn del" title="Excluir" onclick="deleteRecord('${record.id}')">🗑️</button>
                     </div>
                 </td>
-            </tr>`;
+            </tr>
+        `;
     }).join('');
 }
 
-/* ---------------- Eventos ---------------- */
+/* ============================================================
+   EVENTOS
+============================================================ */
 
 document.addEventListener('DOMContentLoaded', async () => {
-    db = await openDB();
-    await initFolderUI();
-    await loadCarriers();
-    await loadRecords();
+    try {
+        db = await openDB();
+        await initFolderUI();
+        await loadCarriers();
+        await loadRecords();
 
-    document.getElementById('select-folder-btn').addEventListener('click', selectBaseFolder);
+        document.getElementById('select-folder-btn')?.addEventListener(
+            'click',
+            selectBaseFolder
+        );
 
-    document.getElementById('manage-carriers-btn').addEventListener('click', openCarriersModal);
-    document.getElementById('carriers-close').addEventListener('click', closeCarriersModal);
-    document.getElementById('carriers-modal').addEventListener('click', (e) => {
-        if (e.target.id === 'carriers-modal') closeCarriersModal();
-    });
-    document.getElementById('add-carrier-btn').addEventListener('click', async () => {
-        const input = document.getElementById('new-carrier-input');
-        await addCarrierManually(input.value);
-        input.value = '';
-        input.focus();
-    });
-    document.getElementById('new-carrier-input').addEventListener('keydown', async (e) => {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            document.getElementById('add-carrier-btn').click();
-        }
-    });
+        document.getElementById('manage-carriers-btn')?.addEventListener(
+            'click',
+            openCarriersModal
+        );
 
-    document.getElementById('reg-form').addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const nfe = document.getElementById('f-nfe').value;
-        const cliente = document.getElementById('f-cliente').value;
-        const transportadora = document.getElementById('f-transportadora').value;
-        if (!nfe.trim() || !cliente.trim() || !transportadora.trim()) {
-            showToast('Preencha NF-e, Cliente e Transportadora.', true);
-            return;
-        }
-        await addRecord(nfe, cliente, transportadora);
-        e.target.reset();
-        document.getElementById('f-nfe').focus();
-    });
+        document.getElementById('carriers-close')?.addEventListener(
+            'click',
+            closeCarriersModal
+        );
 
-    document.getElementById('file-input').addEventListener('change', async (e) => {
-        const file = e.target.files[0];
-        e.target.value = '';
-        if (file) await handleFileSelected(file);
-    });
+        document.getElementById('carriers-modal')?.addEventListener(
+            'click',
+            (event) => {
+                if (event.target.id === 'carriers-modal') {
+                    closeCarriersModal();
+                }
+            }
+        );
 
-    document.getElementById('search-input').addEventListener('input', (e) => {
-        currentSearch = e.target.value.trim();
-        renderTable();
-    });
+        document.getElementById('add-carrier-btn')?.addEventListener(
+            'click',
+            async () => {
+                const input = document.getElementById('new-carrier-input');
 
-    document.querySelectorAll('.filter-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-            document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
-            chip.classList.add('active');
-            currentFilter = chip.dataset.filter;
-            renderTable();
+                if (!input) {
+                    return;
+                }
+
+                await addCarrierManually(input.value);
+                input.value = '';
+                input.focus();
+            }
+        );
+
+        document.getElementById('new-carrier-input')?.addEventListener(
+            'keydown',
+            (event) => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    document.getElementById('add-carrier-btn')?.click();
+                }
+            }
+        );
+
+        document.getElementById('reg-form')?.addEventListener(
+            'submit',
+            async (event) => {
+                event.preventDefault();
+
+                const nfeInput = document.getElementById('f-nfe');
+                const clientInput = document.getElementById('f-cliente');
+                const carrierInput = document.getElementById('f-transportadora');
+
+                if (!nfeInput || !clientInput || !carrierInput) {
+                    showToast('Campos do cadastro não encontrados.', true);
+                    return;
+                }
+
+                const nfe = nfeInput.value.trim();
+                const client = clientInput.value.trim();
+                const carrier = carrierInput.value.trim();
+                const shippingDate = getRegistrationDateValue();
+
+                if (!nfe || !client || !carrier) {
+                    showToast('Preencha NF-e, Cliente e Transportadora.', true);
+                    return;
+                }
+
+                await addRecord(
+                    nfe,
+                    client,
+                    carrier,
+                    shippingDate
+                );
+
+                event.target.reset();
+                nfeInput.focus();
+            }
+        );
+
+        document.getElementById('file-input')?.addEventListener(
+            'change',
+            async (event) => {
+                const file = event.target.files?.[0];
+                event.target.value = '';
+
+                if (file) {
+                    await handleFileSelected(file);
+                }
+            }
+        );
+
+        document.getElementById('search-input')?.addEventListener(
+            'input',
+            (event) => {
+                currentSearch = event.target.value.trim();
+                renderTable();
+            }
+        );
+
+        document.querySelectorAll('.filter-chip').forEach((chip) => {
+            chip.addEventListener('click', () => {
+                document.querySelectorAll('.filter-chip').forEach(
+                    (otherChip) => otherChip.classList.remove('active')
+                );
+
+                chip.classList.add('active');
+                currentFilter = chip.dataset.filter;
+                renderTable();
+            });
         });
-    });
 
-    document.getElementById('edit-cancel').addEventListener('click', closeEditModal);
-    document.getElementById('edit-save').addEventListener('click', saveEdit);
-    document.getElementById('edit-modal').addEventListener('click', (e) => {
-        if (e.target.id === 'edit-modal') closeEditModal();
-    });
+        document.getElementById('edit-cancel')?.addEventListener(
+            'click',
+            closeEditModal
+        );
+
+        document.getElementById('edit-save')?.addEventListener(
+            'click',
+            saveEdit
+        );
+
+        document.getElementById('edit-modal')?.addEventListener(
+            'click',
+            (event) => {
+                if (event.target.id === 'edit-modal') {
+                    closeEditModal();
+                }
+            }
+        );
+    } catch (error) {
+        console.error('Erro ao iniciar o sistema:', error);
+        showToast('Erro ao iniciar o sistema. Consulte o console.', true);
+    }
 });
 
-// expõe funções usadas via onclick inline
+/* ============================================================
+   FUNÇÕES UTILIZADAS PELO HTML
+============================================================ */
+
 window.requestUpload = requestUpload;
 window.viewFile = viewFile;
 window.openEditModal = openEditModal;
