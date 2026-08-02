@@ -1,21 +1,47 @@
-MIT License
+# Licença MIT — Tradução para português (Brasil)
 
-Copyright (c) 2025 Julio Cezar
+> **Aviso:** esta tradução serve apenas para facilitar a compreensão. O arquivo
+> `LICENSE`, escrito em inglês, é o texto jurídico adotado pelo projeto e deve
+> prevalecer em caso de divergência de interpretação.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+## Tradução
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+**Licença MIT**
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Copyright (c) 2025–2026 Palletoptimizer
+
+É concedida permissão, gratuitamente, a qualquer pessoa que obtenha uma cópia
+deste software e dos arquivos de documentação associados (o “Software”), para
+usar o Software sem restrições, incluindo, sem limitação, os direitos de usar,
+copiar, modificar, mesclar, publicar, distribuir, sublicenciar e/ou vender
+cópias do Software, bem como permitir que pessoas às quais o Software seja
+fornecido façam o mesmo, desde que sejam observadas as seguintes condições:
+
+O aviso de direitos autorais acima e este aviso de permissão deverão ser
+incluídos em todas as cópias ou partes substanciais do Software.
+
+O SOFTWARE É FORNECIDO “NO ESTADO EM QUE SE ENCONTRA”, SEM GARANTIAS DE QUALQUER
+TIPO, EXPRESSAS OU IMPLÍCITAS, INCLUINDO, ENTRE OUTRAS, GARANTIAS DE
+COMERCIALIZAÇÃO, ADEQUAÇÃO A UMA FINALIDADE ESPECÍFICA E NÃO VIOLAÇÃO DE
+DIREITOS. EM NENHUMA HIPÓTESE OS AUTORES OU TITULARES DOS DIREITOS AUTORAIS
+SERÃO RESPONSÁVEIS POR QUALQUER REIVINDICAÇÃO, DANO OU OUTRA RESPONSABILIDADE,
+SEJA EM AÇÃO CONTRATUAL, ATO ILÍCITO OU DE OUTRA NATUREZA, DECORRENTE DO
+SOFTWARE, DE SEU USO OU DE OUTRAS RELAÇÕES COM O SOFTWARE.
+
+## Explicação em linguagem simples
+
+Esta licença permite que outras pessoas:
+
+- utilizem o Palletoptimizer para fins pessoais, educacionais ou comerciais;
+- copiem, alterem e integrem o código a outros projetos;
+- distribuam, sublicenciem ou vendam cópias do software.
+
+A obrigação principal é manter o aviso de copyright e o texto da Licença MIT
+nas cópias ou partes substanciais do projeto.
+
+O software é entregue sem garantia. O autor ou titular dos direitos autorais
+não assume responsabilidade por prejuízos, falhas operacionais, cálculos
+incorretos, decisões fiscais, perdas logísticas ou outros danos relacionados ao
+uso do sistema.
+
+> Este resumo não substitui aconselhamento jurídico profissional.
